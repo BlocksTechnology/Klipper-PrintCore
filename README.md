@@ -1,3 +1,4 @@
+![alt](resources/logo.png)
 # Blocks Removable Print Core
 
 A Removable print core implementation for Blocks printers by Blocks.
