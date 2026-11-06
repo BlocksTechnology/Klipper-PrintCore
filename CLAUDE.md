@@ -44,7 +44,8 @@ Testar:
 
 ## Decisões técnicas e porquê
 
-- **Shutdown só quando o RTD deixa de ler**, não quando o ID oscila: o ID pode ter ruído; o que protege o aquecedor é o RTD.
+- **Durante uma impressão o nozzle fica fixo**: o nozzle lido no início (`print_stats` em `printing`/`paused`) mantém-se até ao fim e o ID é ignorado. O módulo não bloqueia aquecimento nem faz shutdown durante a impressão, inclusive em pausa com o aquecedor a 0: só as proteções do próprio Klipper (`verify_heater`, sensor) param a máquina. O ID é apenas contado e, no fim, avisa-se o utilizador se saltou (3 leituras seguidas fora da janela do nozzle, `id_print_faults`) ou se já não lê o nozzle da impressão. Impressão sem ID válido no início: não consegue aquecer. Impressão com bypass: não é reportada, porque o problema já é conhecido.
+- **Fora de impressão, shutdown só quando o RTD deixa de ler**, não quando o ID oscila: o ID pode ter ruído; o que protege o aquecedor é o RTD.
 - **Durante a troca o polling do MAX31865 é parado** e o aquecimento fica bloqueado, para que retirar o core não dispare a proteção. É rearmado no fim, com confirmação de que chegam leituras.
 - **Sem shutdown por sensor mau no fim da troca**: `PRINT_CORE_CHANGE_DONE` recusa com uma mensagem de erro e a troca fica ativa. Em modo de troca o aquecimento está bloqueado, por isso o shutdown não acrescentaria segurança.
 - **Shutdowns do fluxo**: tempo limite da troca (`swap_timeout`, por omissão 1200 s), com aviso 60 s antes e extensão por `PRINTCORE_SWAP_EXTEND`. Há mais dois em `PRINTCORE_SWAP_END`, depois de religar o polling: sem leituras em 3 s, ou leitura a diferir mais de 5 °C do teste direto ao RTD.
@@ -83,15 +84,13 @@ Feito (só validado em simulação):
 Falta:
 - Validar tudo numa máquina real.
 - Comparação do nozzle do slicer (`NOZZLE_SIZE={nozzle_diameter[0]}`) com o print core no `PRINT_START`: **proposta documentada, não aplicada**.
-- Corrigir o módulo `bed_custom_bound.py` (ver abaixo), que é do utilizador e não está na repo.
-- Trabalho do LCD (do programador do LCD): ler os novos campos e erros, botão de estender a troca, traduzir shutdown por termístor avariado.
+- Corrigir o módulo `bed_custom_bound.py` (ver abaixo), que está em `BlocksTechnology/klipper` (`klippy/extras/`), com cópia em `BlocksScreen` (`extras/k_extras/`, alguns branches).
+- Trabalho do LCD (do programador do LCD): ler os novos campos e erros, botão de estender a troca, traduzir shutdown por termístor avariado, novos campos `print_nozzle` e `id_print_faults`.
 
 Problemas conhecidos:
-- O commit `f684f7e` (RobeMartins) removeu os códigos `[PC-01]` a `[PC-09]` e o comando `PRINTCORE_LOG`, que existiam em `387b1da` **(a confirmar se foi intencional)**. `printcore.cfg:63` ainda refere `PRINTCORE_LOG`.
-- `printcore.py:1037`: a mensagem de hotend a aquecer em `PRINTCORE_SWAP_START` junta o texto do utilizador e o de developer numa só string, e fica ilegível.
-- `printcore.py:1293`: falta um espaço, a mensagem sai como "mountedbut".
-- `printcore.cfg:69-70`: o comentário diz que o bypass fica guardado, mas o código descarta-o no arranque.
-- `bed_custom_bound.py` lê `MOVE_TO_PARK=False` como verdadeiro (`parser=bool` sobre a string "False"), o que levava a um parque indesejado em X0 Y500. As macros deixaram de passar esse parâmetro; o módulo em si **não foi corrigido** e também escreve em `kin.limits` diretamente. A correção só deve ser feita depois de confirmar que nada dependia do parque após o homing.
+- O commit `f684f7e` (RobeMartins) removeu os códigos `[PC-01]` a `[PC-09]` e o comando `PRINTCORE_LOG`, que existiam em `387b1da` **(a confirmar se foi intencional)**. Os comentários do `printcore.cfg` já não referem o comando; o comando e os códigos não foram repostos.
+- O bypass ainda é escrito em `variables.cfg`, mas esse valor só é lido no arranque para ser apagado. A escrita é código morto e pode ser removida.
+- `bed_custom_bound.py` lê `MOVE_TO_PARK=False` como verdadeiro (`parser=bool` sobre a string "False"), o que leva a um parque indesejado em X0 Y500. As macros do print core deixaram de passar esse parâmetro, mas as da RF50 ainda o passam (`homing-override`, `clean_nozzle`, `park`, `prime_extruder`); o módulo em si **não foi corrigido** e também escreve em `kin.limits` diretamente. A correção só deve ser feita depois de confirmar que nada dependia do parque após o homing.
 - Com o termístor avariado no arranque, a máquina não chega a ficar pronta (shutdown do MCU antes de o módulo correr). Isto vem de ler o código do Klipper de referência e **precisa de confirmação no `klippy.log`**.
 - Se os sensores do Happy Hare devolverem `None`, a troca é bloqueada; ver a mensagem de aborto.
 - Nunca se percebeu por que razão o utilizador não viu uma mensagem antiga de 5 s "ID not detected but temperature sensor works"; o código dela foi depois substituído.

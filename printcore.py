@@ -26,6 +26,7 @@ ID_MSG_INTERVAL = 10.0
 ERR_DEDUP_SECS = 0.5
 SWAP_WARN_SECS = 60.0
 ID_MSG_BURST = 4
+PRINT_ACTIVE = ("printing", "paused")
 
 BLOCKED_COMMANDS = (
     "G28",
@@ -155,6 +156,15 @@ class PrintCore:
         self._recover = 0
         self._clearing = False
         self._sv = None
+
+        # Nozzle read when the print started. It holds until the print ends,
+        # whatever the ID does: during a print only Klipper's own heater and
+        # sensor checks may stop the machine.
+        self.print_nozzle = ""
+        self._print_bypassed = False
+        self.id_print_faults = 0
+        self._id_bad_run = 0
+        self._id_print_min = self._id_print_max = None
         self.monitor_timer = self.reactor.register_timer(
             self._monitor_cb, self.reactor.NEVER
         )
@@ -324,6 +334,7 @@ class PrintCore:
         orig_set_temp = self.heater.set_temp
 
         def guarded_set_temp(degrees):
+            self._sync_print()
             if not self._temp_change_ok(degrees):
                 raise self.printer.command_error(self._heating_blocked_msg())
             return orig_set_temp(degrees)
@@ -348,8 +359,11 @@ class PrintCore:
     def _temp_change_ok(self, degrees):
         if degrees <= 0.0 or self.heating_allowed():
             return True
-        # Already heating with a good RTD: a flapping ID must not abort the
-        # print. Switching on from off still needs a valid ID.
+        # A print only gets here if it never had a valid ID to hold.
+        if self._printing():
+            return False
+        # Outside a print, already heating with a good RTD: a flapping ID
+        # must not drop the heater. Switching on from off needs a valid ID.
         return (
             not self.swap_active
             and not self._faulted
@@ -396,17 +410,122 @@ class PrintCore:
 
     @property
     def eff_state(self):
-        if self.state == PRESENT or self._bypass_active():
+        if self.print_nozzle or self.state == PRESENT or self._bypass_active():
             return PRESENT
         return self.state
 
     @property
     def eff_nozzle(self):
+        if self.print_nozzle:
+            return self.print_nozzle
         if self.state == PRESENT:
             return self.nozzle
         if self._bypass_active():
             return self.bypass_nozzle
         return ""
+
+    def _printing(self):
+        ps = self.printer.lookup_object("print_stats", None)
+        if ps is None:
+            return False
+        return ps.get_status(self.reactor.monotonic()).get("state") in PRINT_ACTIVE
+
+    def _sync_print(self):
+        if self._printing():
+            if (
+                not self.print_nozzle
+                and not self.swap_active
+                and self.eff_state == PRESENT
+            ):
+                self._hold_nozzle()
+        elif self.print_nozzle:
+            self._release_nozzle()
+
+    def _hold_nozzle(self):
+        self._print_bypassed = self._bypass_active()
+        self.print_nozzle = self.eff_nozzle
+        self.id_print_faults = 0
+        self._id_bad_run = 0
+        self._id_print_min = self._id_print_max = None
+        logging.info(
+            "printcore: holding %s for this print (ID bypass=%s)",
+            self.print_nozzle,
+            self._print_bypassed,
+        )
+
+    def _track_print_id(self, counts):
+        # Only counts: the result is reported when the print ends
+        if not self.print_nozzle or self._print_bypassed:
+            return
+        if self._id_print_min is None:
+            self._id_print_min = self._id_print_max = counts
+        self._id_print_min = min(self._id_print_min, counts)
+        self._id_print_max = max(self._id_print_max, counts)
+        c, h = self._hold[self.print_nozzle]
+        if abs(counts - c) <= h:
+            self._id_bad_run = 0
+            return
+        self._id_bad_run += 1
+        if self._id_bad_run == self.debounce:
+            self.id_print_faults += 1
+            logging.warning(
+                "printcore: ID left %s during the print (ADC %.0f, fault %d)",
+                self.print_nozzle,
+                counts,
+                self.id_print_faults,
+            )
+
+    def _id_now_text(self):
+        if self.state == PRESENT:
+            return "now reads %s" % pretty(self.nozzle)
+        if self.state == ABSENT:
+            return "is not being read"
+        if self.counts is not None and self.counts < 100.0:
+            return "reads 0"
+        return "is not valid"
+
+    def _release_nozzle(self):
+        nozzle, self.print_nozzle = self.print_nozzle, ""
+        faults = self.id_print_faults
+        id_ok = self.state == PRESENT and self.nozzle == nozzle
+        logging.info(
+            "printcore: released %s after the print (ID faults=%d, ADC %s to %s)",
+            nozzle,
+            faults,
+            self._id_print_min,
+            self._id_print_max,
+        )
+        if self._print_bypassed or (id_ok and not faults):
+            return
+        dev = (
+            "!! printcore: print used %s; ID faults=%d, ADC range %s to %s, "
+            "now id_state=%s ADC %s. Possible: %s"
+            % (
+                nozzle,
+                faults,
+                self._id_print_min,
+                self._id_print_max,
+                self.state,
+                "-" if self.counts is None else "%.0f" % self.counts,
+                self._id_hint(),
+            )
+        )
+        if id_ok:
+            user = (
+                "!! Print core: the ID signal was unstable during the print "
+                "(%d times). This did not stop the print. Reseat the print "
+                "core and check its contacts; if it keeps happening, contact "
+                "support." % faults
+            )
+        else:
+            user = (
+                "!! Print core: at the end of the print the ID signal %s (the "
+                "print used a %s nozzle). This did not stop the print. Reseat "
+                "the print core and check its contacts before the next print; "
+                "if it keeps happening, contact support."
+                % (self._id_now_text(), pretty(nozzle))
+            )
+        self._say(None, user, dev)
 
     def _handle_ready(self):
         gcode = self.gcode
@@ -647,6 +766,7 @@ class PrintCore:
     def _id_sample(self, read_value):
         counts = read_value * 4096.0
         self.counts = counts
+        self._track_print_id(counts)
         cand = self._classify(counts)
         if cand == self._cand:
             self._cand_count += 1
@@ -657,8 +777,19 @@ class PrintCore:
             self._commit(cand[0], cand[1], counts)
 
     def _commit(self, state, nozzle, counts):
+        # Before the state changes: a print that started on a good ID must
+        # hold that nozzle, not the reading that is arriving now.
+        self._sync_print()
         prev = (self.state, self.nozzle)
         self.state, self.nozzle, self.counts = state, nozzle, counts
+        if self.print_nozzle:
+            logging.info(
+                "printcore: ID %s/%s during the print (ADC %.0f), ignored",
+                state,
+                nozzle,
+                counts,
+            )
+            return
         if self.swap_active:
             self._pc02_pending = False
             if state != PRESENT:
@@ -717,7 +848,7 @@ class PrintCore:
         self._sv = self.printer.lookup_object("save_variables", None)
         if self._sv is None:
             logging.warning(
-                "printcore: no [save_variables]; ID bypass will not survive a restart"
+                "printcore: no [save_variables]; a saved ID bypass cannot be cleared"
             )
             return
         # The bypass never survives a restart: discard any saved one
@@ -768,8 +899,9 @@ class PrintCore:
     def _monitor_cb(self, eventtime):
         # Timer callback: must never raise
         try:
+            self._sync_print()
             ok = self._rtd_ok()
-            if not ok or self.state == PRESENT:
+            if not ok or self.state == PRESENT or self.print_nozzle:
                 self._contra = 0
             else:
                 self._contra += 1
@@ -807,7 +939,12 @@ class PrintCore:
                         names,
                     ),
                 )
-            if self.bypass_nozzle and self.state == PRESENT and ok:
+            if (
+                self.bypass_nozzle
+                and self.state == PRESENT
+                and ok
+                and not self.print_nozzle
+            ):
                 self._recover += 1
             else:
                 self._recover = 0
@@ -961,25 +1098,12 @@ class PrintCore:
             )
         self.bypass_nozzle = name
         saved = self._save_bypass(gcmd, name)
-        if saved:
-            self._say(
-                gcmd,
-                "Print core: ID check bypassed. Assuming %s nozzle. "
-                "Run PRINTCORE_ID_BYPASS CLEAR=1 to undo." % pretty(name),
-                "printcore: ID bypass ON (%s, saved=True)" % name,
-            )
-        else:
-            why = (
-                "no [save_variables]"
-                if self._sv is None
-                else "saving failed, see klippy.log"
-            )
-            self._say(
-                gcmd,
-                "Print core: ID check bypassed. Assuming %s nozzle. "
-                "Warning: it will be lost on restart (%s)." % (pretty(name), why),
-                "printcore: ID bypass ON (%s, NOT saved: %s)" % (name, why),
-            )
+        self._say(
+            gcmd,
+            "Print core: ID check bypassed. Assuming %s nozzle until the next "
+            "swap or restart. Run PRINTCORE_ID_BYPASS CLEAR=1 to undo." % pretty(name),
+            "printcore: ID bypass ON (%s, saved=%s)" % (name, saved),
+        )
 
     def _next_clock(self, delay=0.3):
         pt = self.mcu.estimated_print_time(self.reactor.monotonic()) + delay
@@ -1036,6 +1160,7 @@ class PrintCore:
             raise gcmd.error(
                 self.M(
                     "Print core: the hotend is heating. Turn it off (M104 S0) "
+                    "and wait for it to cool down.",
                     "printcore: heater target %.0f C; run M104 S0 and wait for "
                     "it to cool" % (h.target_temp,),
                 )
@@ -1282,15 +1407,16 @@ class PrintCore:
             saved = self._save_bypass(gcmd, want)
             self._say(
                 gcmd,
-                "Print core: ID check bypassed. Assuming %s nozzle. "
-                "Run PRINTCORE_ID_BYPASS CLEAR=1 to undo." % pretty(want),
+                "Print core: ID check bypassed. Assuming %s nozzle until the "
+                "next swap or restart. Run PRINTCORE_ID_BYPASS CLEAR=1 to undo."
+                % pretty(want),
                 "printcore: ID bypass ON at swap end (%s, saved=%s)" % (want, saved),
             )
             return
         lst = ", ".join(names)
         if self.bypass_code:
             user = (
-                "Print core: the print core is mounted"
+                "Print core: the print core is mounted "
                 "but its ID cannot be "
                 "read. Reseat it; if it still fails, contact support. "
                 "The swap stays active."
@@ -1504,7 +1630,8 @@ class PrintCore:
             user,
             "printcore: id_state=%s eff_state=%s nozzle=%s adc=%s "
             "id_bypass=%s id_fault_suspected=%s swap_active=%s "
-            "heating_allowed=%s motion_locked=%s log_level=%d"
+            "heating_allowed=%s motion_locked=%s print_nozzle=%s "
+            "id_print_faults=%d log_level=%d"
             % (
                 self.state,
                 self.eff_state,
@@ -1515,6 +1642,8 @@ class PrintCore:
                 self.swap_active,
                 self.heating_allowed(),
                 self.swap_active,
+                self.print_nozzle or "-",
+                self.id_print_faults,
                 self.log_level,
             ),
         )
@@ -1564,6 +1693,8 @@ class PrintCore:
             "id_bypass": self._bypass_active(),
             "bypass_nozzle": self.bypass_nozzle,
             "id_fault_suspected": self.id_fault_suspected,
+            "print_nozzle": self.print_nozzle,
+            "id_print_faults": self.id_print_faults,
             "phase": str(phase),
             "swap_active": self.swap_active,
             "swap_timeout_left": left,
