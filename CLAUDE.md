@@ -38,7 +38,7 @@ Instalar (a confirmar os caminhos exatos na máquina):
 Requisitos: sensor `MAX31865` no aquecedor. O cabeçalho do módulo indica que **não foi testado em hardware**.
 
 Testar:
-- Até agora só **testes simulados** (objetos Klipper falsos e um simulador de macros), que **não estão na repo**; estavam no ambiente de trabalho da sessão.
+- Até agora só **testes simulados** com objetos Klipper falsos. A lógica do nozzle fixo durante o print está em `tests/test_print_hold.py` (`python tests/test_print_hold.py`, só precisa de Python). Os testes anteriores e o simulador de macros **não estão na repo**; estavam no ambiente de trabalho da sessão.
 - Antes de entregar qualquer `.cfg`, validá-lo com o parser de config do Klipper e compilar os templates Jinja. Falhou uma vez em produção por um comentário `{# ... #}`.
 - Testes na máquina real ainda por fazer: fluxo completo com filamento, ordem das mensagens com o Happy Hare, comportamento com ID morto e com termístor avariado.
 
