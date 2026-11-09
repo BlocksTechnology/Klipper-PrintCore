@@ -59,6 +59,7 @@ Testar:
 - **Posição de troca** `X251 Y250 Z50`, editável na tabela de `PRINT_CORE_POSITIONS`.
 - **Filtro do ID**: debounce de 3 leituras (~0,9 s) e histerese; o tratamento de ruído foi deixado como está por agora.
 - **Erros duplicados na consola** vêm do Klipper (cada nível de macro repete o erro); o módulo deduplica mensagens idênticas em 0,5 s.
+- **Leituras do ID passadas ao reactor**: o Klipper chama o callback do ADC na thread série; `_id_callback` só recolhe os valores e entrega-os com `register_async_callback`, para que timers, mensagens, shutdown e o nozzle fixo corram no reactor.
 
 ## Convenções
 

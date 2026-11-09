@@ -27,7 +27,11 @@ class Reactor:
     def monotonic(self): return self.t
     def register_timer(self, cb, when): return object()
     def update_timer(self, t, when): pass
-    def register_async_callback(self, cb): self.async_cb = cb
+    def __init__(self): self.queued = []
+    def register_async_callback(self, cb): self.queued.append(cb)
+    def run_queued(self):
+        q, self.queued = self.queued, []
+        for cb in q: cb(self.t)
     def pause(self, w): self.t = w
 
 class Gcode:
@@ -247,6 +251,33 @@ class T(unittest.TestCase):
         g = types.SimpleNamespace(error=lambda m: CmdErr(m), respond_info=print)
         with self.assertRaises(CmdErr):
             self.m._check_idle(g)
+
+    def test_adc_callback_defers_to_reactor(self):
+        # Serial thread: nothing may run until the reactor picks it up
+        adc = self.m.id_adc
+        self.pr.reactor.queued.clear()
+        adc.cb([(0.0, OPEN)] * 3)
+        self.assertEqual(self.m.state, pc.PRESENT)
+        self.assertEqual(len(self.pr.reactor.queued), 1)
+        self.pr.reactor.run_queued()
+        self.assertEqual(self.m.state, pc.ABSENT)
+
+    def test_adc_callback_shutdown_runs_on_reactor(self):
+        self.h.target_temp = 200.0
+        self.h.last_temp_time = 0.0
+        self.m.id_adc.cb([(0.0, OPEN)] * 3)
+        self.assertEqual(self.pr.shutdowns, [])
+        self.pr.reactor.run_queued()
+        self.assertEqual(len(self.pr.shutdowns), 1)
+
+    def test_adc_callback_old_api_and_bad_samples(self):
+        self.pr.reactor.queued.clear()
+        self.m.id_adc.cb([(0.0,), None])
+        self.assertEqual(self.pr.reactor.queued, [])
+        for _ in range(3):
+            self.m._id_callback(0.0, OPEN)
+        self.pr.reactor.run_queued()
+        self.assertEqual(self.m.state, pc.ABSENT)
 
     def test_msg_fixes(self):
         src = open(os.path.join(REPO, "printcore.py"), encoding="utf-8").read()

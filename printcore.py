@@ -755,13 +755,29 @@ class PrintCore:
             adc.setup_adc_callback(self._id_callback)
 
     def _id_callback(self, *args):
+        # Klipper calls this from the serial reader thread, not the reactor:
+        # hand the values over so all the ID logic (timers, messages,
+        # shutdown, print hold) runs on the reactor like the rest.
         samples = args[0] if len(args) == 1 else [args]
+        values = []
         for sample in samples:
             try:
                 _, read_value = sample
             except (TypeError, ValueError):
                 continue
-            self._id_sample(read_value)
+            values.append(read_value)
+        if values:
+            self.reactor.register_async_callback(
+                lambda eventtime, values=values: self._id_samples(values)
+            )
+
+    def _id_samples(self, values):
+        # Reactor callback: must never raise
+        try:
+            for read_value in values:
+                self._id_sample(read_value)
+        except Exception:
+            logging.exception("printcore: ID sample error")
 
     def _id_sample(self, read_value):
         counts = read_value * 4096.0
