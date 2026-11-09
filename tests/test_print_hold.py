@@ -279,6 +279,46 @@ class T(unittest.TestCase):
         self.pr.reactor.run_queued()
         self.assertEqual(self.m.state, pc.ABSENT)
 
+    def test_swap_probe_insert_and_remove(self):
+        # Swap with no core: RTD silent, ID open
+        self.feed(OPEN, 3)
+        self.m.swap_active = True
+        self.m._rtd = pc.RTD_GONE
+        res = [("u", "d")]
+        self.m._rtd_probe = lambda: res[0]
+        self.pr.gcode.out.clear()
+        self.m._probe_cb(0)
+        self.assertEqual(self.m._rtd, pc.RTD_GONE)
+        # RTD responds, ID still open: wait one probe, say nothing
+        res[0] = None
+        self.m._probe_cb(0)
+        self.assertEqual(self.m._rtd, pc.RTD_NEW)
+        self.assertEqual(self.pr.gcode.out, [])
+        # Second probe: report the unreadable ID once
+        self.m._probe_cb(0)
+        self.assertEqual(self.m._rtd, pc.RTD_SEEN)
+        self.assertEqual(len(self.pr.gcode.out), 1)
+        self.assertIn("ID cannot be read", self.pr.gcode.out[0])
+        self.m._probe_cb(0)
+        self.assertEqual(len(self.pr.gcode.out), 1)
+        # RTD stops: removed
+        res[0] = ("u", "d")
+        self.m._probe_cb(0)
+        self.assertEqual(self.m._rtd, pc.RTD_GONE)
+        self.assertIn("removed", self.pr.gcode.out[-1])
+
+    def test_swap_probe_id_arrives_before_report(self):
+        self.feed(OPEN, 3)
+        self.m.swap_active = True
+        self.m._rtd = pc.RTD_GONE
+        self.m._rtd_probe = lambda: None
+        self.m._probe_cb(0)
+        self.assertEqual(self.m._rtd, pc.RTD_NEW)
+        self.pr.gcode.out.clear()
+        self.feed(C04, 3)
+        self.assertEqual(self.m._rtd, pc.RTD_SEEN)
+        self.assertFalse(any("cannot be read" in m for m in self.pr.gcode.out))
+
     def test_msg_fixes(self):
         src = open(os.path.join(REPO, "printcore.py"), encoding="utf-8").read()
         self.assertNotIn("(M104 S0) \"\n                    \"printcore:", src)

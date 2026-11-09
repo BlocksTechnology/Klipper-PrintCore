@@ -70,6 +70,11 @@ QUERY_FMT = (
     " min_value=%u max_value=%u max_invalid_count=%c"
 )
 
+# What the swap's RTD probe has seen of the mounted core
+RTD_GONE = "gone"  # sensor not responding: no core, or removed
+RTD_NEW = "new"  # sensor just responded, ID not read yet: wait one probe
+RTD_SEEN = "seen"  # sensor responding (unreadable ID already reported)
+
 RTD_MSB_REG = 0x01
 FAULT_STATUS_REG = 0x07
 
@@ -129,8 +134,7 @@ class PrintCore:
         )
         self._probing = False
         self._ending = False
-        self._rtd_present = False
-        self._pc02_pending = False
+        self._rtd = RTD_GONE
         self._probe_avg = 0.0
 
         self.tol = config.getfloat("id_tolerance", 15.0, above=0.0)
@@ -224,6 +228,34 @@ class PrintCore:
             return dev
         return user
 
+    def _err(self, gcmd, user, dev=None):
+        return gcmd.error(self.M(user, dev))
+
+    def _names_str(self):
+        return ", ".join(self._nozzle_names())
+
+    def _check_no_swap(self, gcmd):
+        if self.swap_active:
+            raise self._err(
+                gcmd,
+                "Print core: a swap is in progress.",
+                "printcore: swap in progress",
+            )
+
+    def _check_swap(self, gcmd):
+        if not self.swap_active:
+            raise self._err(
+                gcmd,
+                "Print core: no swap in progress.",
+                "printcore: no swap in progress",
+            )
+
+    def _bypass_on_msg(self, name):
+        return (
+            "Print core: ID check bypassed. Assuming %s nozzle until the next "
+            "swap or restart. Run PRINTCORE_ID_BYPASS CLEAR=1 to undo." % pretty(name)
+        )
+
     def _say(self, gcmd, user, dev=None):
         msg = self.M(user, dev)
         if msg.startswith("!! "):
@@ -239,13 +271,12 @@ class PrintCore:
         return not self.bypass_code or gcmd.get("CODE", "") == self.bypass_code
 
     def _code_error(self, gcmd):
-        return gcmd.error(
-            self.M(
-                "Print core: a service code is needed to continue "
-                "without the ID. Contact support."
-                + (" The swap stays active." if self.swap_active else ""),
-                "printcore: bypass_code set; CODE=code missing or wrong",
-            )
+        return self._err(
+            gcmd,
+            "Print core: a service code is needed to continue "
+            "without the ID. Contact support."
+            + (" The swap stays active." if self.swap_active else ""),
+            "printcore: bypass_code set; CODE=code missing or wrong",
         )
 
     def _id_say_ok(self):
@@ -428,7 +459,7 @@ class PrintCore:
         ps = self.printer.lookup_object("print_stats", None)
         if ps is None:
             return False
-        return ps.get_status(self.reactor.monotonic()).get("state") in PRINT_ACTIVE
+        return getattr(ps, "state", None) in PRINT_ACTIVE
 
     def _sync_print(self):
         if self._printing():
@@ -578,18 +609,15 @@ class PrintCore:
         return guard
 
     def _check_idle(self, gcmd):
-        ps = self.printer.lookup_object("print_stats", None)
-        if ps is not None:
-            state = ps.get_status(self.reactor.monotonic()).get("state")
-            if state in ("printing", "paused"):
-                raise gcmd.error(
-                    self.M(
-                        "Print core: a print is in progress. Cancel it before "
-                        "swapping.",
-                        "printcore: print in progress (%s); cancel it before "
-                        "swapping" % state,
-                    )
-                )
+        if self._printing():
+            state = self.printer.lookup_object("print_stats").state
+            raise self._err(
+                gcmd,
+                "Print core: a print is in progress. Cancel it before "
+                "swapping.",
+                "printcore: print in progress (%s); cancel it before "
+                "swapping" % state,
+            )
 
     def _swap_params(self, gcmd):
         tbl = {}
@@ -608,21 +636,19 @@ class PrintCore:
                 try:
                     return float(tbl[var])
                 except (TypeError, ValueError):
-                    raise gcmd.error(
-                        self.M(
-                            generic,
-                            "printcore: %s in PRINT_CORE_POSITIONS is not a "
-                            "number: %r" % (var, tbl[var]),
-                        )
+                    raise self._err(
+                        gcmd,
+                        generic,
+                        "printcore: %s in PRINT_CORE_POSITIONS is not a "
+                        "number: %r" % (var, tbl[var]),
                     )
             if default is not None:
                 return default
-            raise gcmd.error(
-                self.M(
-                    generic,
-                    "printcore: missing %s: pass it in the command or define %s "
-                    "in [gcode_macro PRINT_CORE_POSITIONS]" % (param, var),
-                )
+            raise self._err(
+                gcmd,
+                generic,
+                "printcore: missing %s: pass it in the command or define %s "
+                "in [gcode_macro PRINT_CORE_POSITIONS]" % (param, var),
             )
 
         def val(param, var, default=None, **kw):
@@ -631,11 +657,10 @@ class PrintCore:
                 return gcmd.get_float(param, **kw)
             lo, above = kw.get("minval"), kw.get("above")
             if (lo is not None and t < lo) or (above is not None and t <= above):
-                raise gcmd.error(
-                    self.M(
-                        generic,
-                        "printcore: %s=%s invalid in PRINT_CORE_POSITIONS" % (var, t),
-                    )
+                raise self._err(
+                    gcmd,
+                    generic,
+                    "printcore: %s=%s invalid in PRINT_CORE_POSITIONS" % (var, t),
                 )
             return t
 
@@ -652,12 +677,11 @@ class PrintCore:
         status = th.get_status(self.reactor.monotonic())
         homed = status["homed_axes"]
         if not all(a in homed for a in "xyz"):
-            raise gcmd.error(
-                self.M(
-                    "Print core: home the printer first.",
-                    "printcore: home XYZ before moving to the swap position "
-                    "(homed='%s')" % (homed,),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: home the printer first.",
+                "printcore: home XYZ before moving to the swap position "
+                "(homed='%s')" % (homed,),
             )
         cur = th.get_position()
         if cur[2] < z:
@@ -668,23 +692,16 @@ class PrintCore:
         self.printer.lookup_object("gcode_move").reset_last_position()
         pos = th.get_position()
         if abs(pos[0] - x) > 0.05 or abs(pos[1] - y) > 0.05 or abs(pos[2] - z) > 0.05:
-            raise gcmd.error(
-                self.M(
-                    "Print core: the toolhead did not reach the swap position.",
-                    "printcore: the toolhead did not reach the swap position "
-                    "(%.2f, %.2f, %.2f)" % tuple(pos[:3]),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: the toolhead did not reach the swap position.",
+                "printcore: the toolhead did not reach the swap position "
+                "(%.2f, %.2f, %.2f)" % tuple(pos[:3]),
             )
         return x, y, z
 
     def cmd_GOTO_SWAP(self, gcmd):
-        if self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a swap is already in progress.",
-                    "printcore: swap already in progress",
-                )
-            )
+        self._check_no_swap(gcmd)
         self._check_idle(gcmd)
         x, y, z = self._goto_swap_pos(gcmd)
         self._say(
@@ -807,9 +824,10 @@ class PrintCore:
             )
             return
         if self.swap_active:
-            self._pc02_pending = False
             if state != PRESENT:
-                self._rtd_present = False
+                self._rtd = RTD_GONE
+            elif self._rtd == RTD_NEW:
+                self._rtd = RTD_SEEN
             self.reactor.update_timer(
                 self._probe_timer,
                 self.reactor.monotonic() + (1.0 if state == PRESENT else 3.0),
@@ -875,21 +893,12 @@ class PrintCore:
                 "(nothing is assumed after a restart)",
                 name,
             )
-            self._save_bypass(None, "")
-
-    def _save_bypass(self, gcmd, name):
-        if self._sv is None:
-            return False
-        cmd = "SAVE_VARIABLE VARIABLE=%s VALUE=\"'%s'\"" % (BYPASS_VAR, name)
-        try:
-            if gcmd is not None:
-                self.gcode.run_script_from_command(cmd)
-            else:
-                self.gcode.run_script(cmd)
-            return True
-        except Exception:
-            logging.exception("printcore: could not save the ID bypass")
-            return False
+            try:
+                self.gcode.run_script(
+                    "SAVE_VARIABLE VARIABLE=%s VALUE=\"''\"" % BYPASS_VAR
+                )
+            except Exception:
+                logging.exception("printcore: could not clear the saved ID bypass")
 
     def _id_hint(self):
         c = self.counts
@@ -924,7 +933,7 @@ class PrintCore:
             was = self.id_fault_suspected
             self.id_fault_suspected = self._contra >= self.id_fault_secs
             if self.id_fault_suspected and not was and not self._bypass_active():
-                names = ", ".join(self._nozzle_names())
+                names = self._names_str()
                 if self.bypass_code:
                     user = (
                         "!! Print core: inserted, but its ID cannot be "
@@ -1009,7 +1018,6 @@ class PrintCore:
     def _auto_clear_cb(self, eventtime):
         try:
             self.bypass_nozzle = ""
-            self._save_bypass(None, "")
             self._say(
                 None,
                 "Print core: the ID signal recovered. Bypass removed.",
@@ -1025,7 +1033,6 @@ class PrintCore:
         if gcmd.get_int("CLEAR", 0):
             had = self.bypass_nozzle
             self.bypass_nozzle = ""
-            saved = self._save_bypass(gcmd, "")
             if not had:
                 self._say(
                     gcmd,
@@ -1036,12 +1043,12 @@ class PrintCore:
                 self._say(
                     gcmd,
                     "Print core: ID bypass removed.",
-                    "printcore: ID bypass removed (saved=%s)" % saved,
+                    "printcore: ID bypass removed",
                 )
             return
         name = gcmd.get("NOZZLE", None)
         if name is None:
-            names = ", ".join(self._nozzle_names())
+            names = self._names_str()
             usage = (
                 "Nozzles: %s. Use: PRINTCORE_ID_BYPASS NOZZLE=name CONFIRM=1" % names
             )
@@ -1064,61 +1071,49 @@ class PrintCore:
         if not self._code_ok(gcmd):
             raise self._code_error(gcmd)
         if gcmd.get_int("CONFIRM", 0) != 1:
-            raise gcmd.error(
-                self.M(
-                    "Print core: add CONFIRM=1 to confirm. You are telling the "
-                    "printer which print core is mounted.",
-                    "printcore: CONFIRM=1 required",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: add CONFIRM=1 to confirm. You are telling the "
+                "printer which print core is mounted.",
+                "printcore: CONFIRM=1 required",
             )
-        if self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a swap is in progress.", "printcore: swap in progress"
-                )
-            )
+        self._check_no_swap(gcmd)
         if self.heating():
-            raise gcmd.error(
-                self.M(
-                    "Print core: turn the heater off first (M104 S0).",
-                    "printcore: heater target > 0; run M104 S0 first",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: turn the heater off first (M104 S0).",
+                "printcore: heater target > 0; run M104 S0 first",
             )
         self._check_idle(gcmd)
         if name not in self._nozzle_names():
-            raise gcmd.error(
-                self.M(
-                    "Print core: unknown nozzle '%s'. Valid names: %s"
-                    % (name, ", ".join(self._nozzle_names())),
-                    "printcore: unknown nozzle '%s' (valid: %s)"
-                    % (name, ", ".join(self._nozzle_names())),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: unknown nozzle '%s'. Valid names: %s"
+                % (name, self._names_str()),
+                "printcore: unknown nozzle '%s' (valid: %s)"
+                % (name, self._names_str()),
             )
         if not self.id_fault_suspected:
             if self.state == PRESENT:
-                raise gcmd.error(
-                    self.M(
-                        "Print core: the ID signal looks fine, so a bypass is "
-                        "not needed.",
-                        "printcore: ID reads %s; bypass not needed" % self.nozzle,
-                    )
+                raise self._err(
+                    gcmd,
+                    "Print core: the ID signal looks fine, so a bypass is "
+                    "not needed.",
+                    "printcore: ID reads %s; bypass not needed" % self.nozzle,
                 )
-            raise gcmd.error(
-                self.M(
-                    "Print core: no ID fault detected yet. The temperature "
-                    "sensor must read normally for %d s with the print core "
-                    "mounted. Wait and try again." % self.id_fault_secs,
-                    "printcore: ID fault not confirmed (RTD ok for %d/%d s)"
-                    % (self._contra, self.id_fault_secs),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: no ID fault detected yet. The temperature "
+                "sensor must read normally for %d s with the print core "
+                "mounted. Wait and try again." % self.id_fault_secs,
+                "printcore: ID fault not confirmed (RTD ok for %d/%d s)"
+                % (self._contra, self.id_fault_secs),
             )
         self.bypass_nozzle = name
-        saved = self._save_bypass(gcmd, name)
         self._say(
             gcmd,
-            "Print core: ID check bypassed. Assuming %s nozzle until the next "
-            "swap or restart. Run PRINTCORE_ID_BYPASS CLEAR=1 to undo." % pretty(name),
-            "printcore: ID bypass ON (%s, saved=%s)" % (name, saved),
+            self._bypass_on_msg(name),
+            "printcore: ID bypass ON (%s)" % name,
         )
 
     def _next_clock(self, delay=0.3):
@@ -1157,51 +1152,41 @@ class PrintCore:
 
     def cmd_SWAP_START(self, gcmd):
         if self.heater is None:
-            raise gcmd.error(
-                self.M(
-                    "Print core: the heater is not available yet.",
-                    "printcore: heater not available yet",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: the heater is not available yet.",
+                "printcore: heater not available yet",
             )
-        if self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a swap is already in progress.",
-                    "printcore: swap already in progress",
-                )
-            )
+        self._check_no_swap(gcmd)
         self._check_idle(gcmd)
         h = self.heater
         if h.target_temp > 0.0:
-            raise gcmd.error(
-                self.M(
-                    "Print core: the hotend is heating. Turn it off (M104 S0) "
-                    "and wait for it to cool down.",
-                    "printcore: heater target %.0f C; run M104 S0 and wait for "
-                    "it to cool" % (h.target_temp,),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: the hotend is heating. Turn it off (M104 S0) "
+                "and wait for it to cool down.",
+                "printcore: heater target %.0f C; run M104 S0 and wait for "
+                "it to cool" % (h.target_temp,),
             )
         temp = max(h.last_temp, h.smoothed_temp)
         if temp > self.safe_temp:
-            raise gcmd.error(
-                self.M(
-                    "Print core: the hotend is too hot (%.0f °C, must be below "
-                    "%.0f °C). Let it cool down, then try again."
-                    % (temp, self.safe_temp),
-                    "printcore: hotend at %.0f C; swap only allowed below %.0f C"
-                    % (temp, self.safe_temp),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: the hotend is too hot (%.0f °C, must be below "
+                "%.0f °C). Let it cool down, then try again."
+                % (temp, self.safe_temp),
+                "printcore: hotend at %.0f C; swap only allowed below %.0f C"
+                % (temp, self.safe_temp),
             )
         self._goto_swap_pos(gcmd)
         # The PWM must be zero before the readings (and PID updates) stop
         deadline = self.reactor.monotonic() + 3.0
         while h.last_pwm_value > 0.0:
             if self.reactor.monotonic() > deadline:
-                raise gcmd.error(
-                    self.M(
-                        "Print core: the heater did not switch off. Swap cancelled.",
-                        "printcore: heater PWM did not reach zero",
-                    )
+                raise self._err(
+                    gcmd,
+                    "Print core: the heater did not switch off. Swap cancelled.",
+                    "printcore: heater PWM did not reach zero",
                 )
             self._pause(0.2)
 
@@ -1214,19 +1199,17 @@ class PrintCore:
         if h.last_temp_time != seen:
             self._start_polling()
             self.swap_active = False
-            raise gcmd.error(
-                self.M(
-                    "Print core: could not enter swap mode safely. Swap "
-                    "cancelled; normal protection kept. Try again; if it "
-                    "keeps happening, restart the printer.",
-                    "printcore: could not confirm sensor polling stopped; swap "
-                    "cancelled, normal protection kept",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: could not enter swap mode safely. Swap "
+                "cancelled; normal protection kept. Try again; if it "
+                "keeps happening, restart the printer.",
+                "printcore: could not confirm sensor polling stopped; swap "
+                "cancelled, normal protection kept",
             )
         if self.swap_timeout:
             self._arm_swap_timer(self.swap_timeout)
-        self._rtd_present = rtd_at_start
-        self._pc02_pending = False
+        self._rtd = RTD_SEEN if rtd_at_start else RTD_GONE
         if self.state != PRESENT:
             self.reactor.update_timer(self._probe_timer, self.reactor.monotonic() + 3.0)
         if self.bypass_nozzle:
@@ -1234,7 +1217,6 @@ class PrintCore:
                 "printcore: swap start clears ID bypass (%s)", self.bypass_nozzle
             )
             self.bypass_nozzle = ""
-            self._save_bypass(gcmd, "")
         self._say(
             gcmd,
             "Print core: swap mode on. Heating and movement are disabled. "
@@ -1309,7 +1291,7 @@ class PrintCore:
         try:
             res = self._rtd_probe()
             if present:
-                self._rtd_present = res is None
+                self._rtd = RTD_SEEN if res is None else RTD_GONE
                 if res is None:
                     self._say(
                         None,
@@ -1326,14 +1308,13 @@ class PrintCore:
                 # The ID became readable during the probe: the commit already
                 # scheduled a fresh probe, so say nothing here
                 pass
-            elif res is None and not self._rtd_present:
+            elif res is None and self._rtd == RTD_GONE:
                 # On insertion the RTD pins can make contact before the ID
                 # pin: wait one more probe before calling the ID unreadable
-                self._rtd_present = True
-                self._pc02_pending = True
-            elif res is None and self._pc02_pending:
-                self._pc02_pending = False
-                names = ", ".join(self._nozzle_names())
+                self._rtd = RTD_NEW
+            elif res is None and self._rtd == RTD_NEW:
+                self._rtd = RTD_SEEN
+                names = self._names_str()
                 self._say(
                     None,
                     "!! Print core: a print core is mounted "
@@ -1351,9 +1332,8 @@ class PrintCore:
                     "!! printcore: RTD ok but ID %s (ADC %.0f)"
                     % (self.state, self.counts or 0.0),
                 )
-            elif res is not None and self._rtd_present:
-                self._rtd_present = False
-                self._pc02_pending = False
+            elif res is not None and self._rtd != RTD_GONE:
+                self._rtd = RTD_GONE
                 self._say(
                     None,
                     "Print core: removed (the temperature sensor no longer responds).",
@@ -1370,11 +1350,10 @@ class PrintCore:
 
     def cmd_CHECK_SENSOR(self, gcmd):
         if not self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: only available during a swap.",
-                    "printcore: PRINTCORE_CHECK_SENSOR needs swap mode",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: only available during a swap.",
+                "printcore: PRINTCORE_CHECK_SENSOR needs swap mode",
             )
         while self._probing:
             self._pause(0.1)
@@ -1384,7 +1363,7 @@ class PrintCore:
         finally:
             self._probing = False
         if res is not None:
-            raise gcmd.error(self.M(*res))
+            raise self._err(gcmd, *res)
         self._say(
             gcmd, "Print core: temperature sensor OK.", "printcore: swap RTD probe ok"
         )
@@ -1406,27 +1385,23 @@ class PrintCore:
         res = self._rtd_probe()
         names = self._nozzle_names()
         if res is not None:
-            raise gcmd.error(
-                self.M(
-                    "Print core: no print core detected. Neither the ID "
-                    "nor the temperature sensor respond. If one is mounted, "
-                    "reseat it and check its contacts, then confirm again. The "
-                    "swap stays active.",
-                    "printcore: ID %s (ADC %.0f) and RTD not readable (%s); "
-                    "swap stays active" % (self.state, self.counts or 0.0, res[1]),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: no print core detected. Neither the ID "
+                "nor the temperature sensor respond. If one is mounted, "
+                "reseat it and check its contacts, then confirm again. The "
+                "swap stays active.",
+                "printcore: ID %s (ADC %.0f) and RTD not readable (%s); "
+                "swap stays active" % (self.state, self.counts or 0.0, res[1]),
             )
         if want in names and gcmd.get_int("CONFIRM", 0) == 1:
             if not self._code_ok(gcmd):
                 raise self._code_error(gcmd)
             self.bypass_nozzle = want
-            saved = self._save_bypass(gcmd, want)
             self._say(
                 gcmd,
-                "Print core: ID check bypassed. Assuming %s nozzle until the "
-                "next swap or restart. Run PRINTCORE_ID_BYPASS CLEAR=1 to undo."
-                % pretty(want),
-                "printcore: ID bypass ON at swap end (%s, saved=%s)" % (want, saved),
+                self._bypass_on_msg(want),
+                "printcore: ID bypass ON at swap end (%s)" % want,
             )
             return
         lst = ", ".join(names)
@@ -1446,69 +1421,59 @@ class PrintCore:
                 "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 "
                 "(names: %s). The swap stays active." % lst
             )
-        raise gcmd.error(
-            self.M(
-                user,
-                "printcore: RTD ok but ID %s (ADC %.0f); need NOZZLE=name "
-                "CONFIRM=1%s (valid: %s); swap stays active"
-                % (
-                    self.state,
-                    self.counts or 0.0,
-                    " CODE=code" if self.bypass_code else "",
-                    lst,
-                ),
-            )
+        raise self._err(
+            gcmd,
+            user,
+            "printcore: RTD ok but ID %s (ADC %.0f); need NOZZLE=name "
+            "CONFIRM=1%s (valid: %s); swap stays active"
+            % (
+                self.state,
+                self.counts or 0.0,
+                " CODE=code" if self.bypass_code else "",
+                lst,
+            ),
         )
 
     def _swap_end(self, gcmd):
-        if not self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: no swap in progress.", "printcore: no swap in progress"
-                )
-            )
+        self._check_swap(gcmd)
         want = gcmd.get("NOZZLE", None)
         autohome = gcmd.get_int("AUTOHOME", 0) == 1
         if self.eff_state != PRESENT:
             self._swap_end_no_id(gcmd, want)
         if self._bypass_active():
-            names = ", ".join(self._nozzle_names())
+            names = self._names_str()
             if want is None or want not in self._nozzle_names():
-                raise gcmd.error(
-                    self.M(
-                        "Print core: the ID cannot be read. %s"
-                        "The swap stays active."
-                        % (
-                            "Contact support. "
-                            if self.bypass_code
-                            else "Say which print core you mounted: "
-                            "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 "
-                            "(names: %s). " % names
-                        ),
-                        "printcore: ID bypass active, NOZZLE=name required at "
-                        "swap end (valid: %s); swap stays active" % names,
-                    )
+                raise self._err(
+                    gcmd,
+                    "Print core: the ID cannot be read. %s"
+                    "The swap stays active."
+                    % (
+                        "Contact support. "
+                        if self.bypass_code
+                        else "Say which print core you mounted: "
+                        "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 "
+                        "(names: %s). " % names
+                    ),
+                    "printcore: ID bypass active, NOZZLE=name required at "
+                    "swap end (valid: %s); swap stays active" % names,
                 )
             if not self._code_ok(gcmd):
                 raise self._code_error(gcmd)
-            if want != self.bypass_nozzle:
-                self.bypass_nozzle = want
-                self._save_bypass(gcmd, want)
+            self.bypass_nozzle = want
         if want is not None and want != self.eff_nozzle:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a different print core is mounted "
-                    "than expected. Mounted: %s, expected: %s. The swap "
-                    "stays active." % (pretty(self.eff_nozzle), pretty(want)),
-                    "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: a different print core is mounted "
+                "than expected. Mounted: %s, expected: %s. The swap "
+                "stays active." % (pretty(self.eff_nozzle), pretty(want)),
+                "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
             )
         res = self._rtd_probe()
         if res is not None:
-            raise gcmd.error(
-                self.M(
-                    res[0] + " The swap stays active.", res[1] + "; swap stays active"
-                )
+            raise self._err(
+                gcmd,
+                res[0] + " The swap stays active.",
+                res[1] + "; swap stays active",
             )
         avg = self._probe_avg
         before = self.heater.last_temp_time
@@ -1602,18 +1567,12 @@ class PrintCore:
         return self.reactor.NEVER
 
     def cmd_SWAP_EXTEND(self, gcmd):
-        if not self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: no swap in progress.", "printcore: no swap in progress"
-                )
-            )
+        self._check_swap(gcmd)
         if not self.swap_timeout:
-            raise gcmd.error(
-                self.M(
-                    "Print core: this swap has no time limit.",
-                    "printcore: swap_timeout is 0, nothing to extend",
-                )
+            raise self._err(
+                gcmd,
+                "Print core: this swap has no time limit.",
+                "printcore: swap_timeout is 0, nothing to extend",
             )
         secs = gcmd.get_float("SECONDS", self.swap_timeout, minval=30.0, maxval=3600.0)
         self._arm_swap_timer(secs)
@@ -1666,27 +1625,20 @@ class PrintCore:
 
     def cmd_REQUIRE(self, gcmd):
         want = gcmd.get("NOZZLE", None)
-        if self.swap_active:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a swap is in progress.", "printcore: swap in progress"
-                )
-            )
+        self._check_no_swap(gcmd)
         if self.eff_state != PRESENT:
-            raise gcmd.error(
-                self.M(
-                    "Print core: no print core detected.",
-                    "printcore: no valid print core (state=%s)" % (self.state,),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: no print core detected.",
+                "printcore: no valid print core (state=%s)" % (self.state,),
             )
         if want is not None and want != self.eff_nozzle:
-            raise gcmd.error(
-                self.M(
-                    "Print core: a different print core is mounted than "
-                    "expected. Mounted: %s, expected: %s."
-                    % (pretty(self.eff_nozzle), pretty(want)),
-                    "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
-                )
+            raise self._err(
+                gcmd,
+                "Print core: a different print core is mounted than "
+                "expected. Mounted: %s, expected: %s."
+                % (pretty(self.eff_nozzle), pretty(want)),
+                "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
             )
 
     def _macro_vars(self, name):

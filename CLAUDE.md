@@ -60,6 +60,7 @@ Testar:
 - **Filtro do ID**: debounce de 3 leituras (~0,9 s) e histerese; o tratamento de ruído foi deixado como está por agora.
 - **Erros duplicados na consola** vêm do Klipper (cada nível de macro repete o erro); o módulo deduplica mensagens idênticas em 0,5 s.
 - **Leituras do ID passadas ao reactor**: o Klipper chama o callback do ADC na thread série; `_id_callback` só recolhe os valores e entrega-os com `register_async_callback`, para que timers, mensagens, shutdown e o nozzle fixo corram no reactor.
+- **Sem códigos `[PC-01]`…`[PC-09]` nem comando `PRINTCORE_LOG`**: removidos de propósito pelo utilizador no commit `f684f7e`. Não os repor.
 
 ## Convenções
 
@@ -89,8 +90,7 @@ Falta:
 - Trabalho do LCD (do programador do LCD): ler os novos campos e erros, botão de estender a troca, traduzir shutdown por termístor avariado, novos campos `print_nozzle` e `id_print_faults`.
 
 Problemas conhecidos:
-- O commit `f684f7e` (RobeMartins) removeu os códigos `[PC-01]` a `[PC-09]` e o comando `PRINTCORE_LOG`, que existiam em `387b1da` **(a confirmar se foi intencional)**. Os comentários do `printcore.cfg` já não referem o comando; o comando e os códigos não foram repostos.
-- O bypass ainda é escrito em `variables.cfg`, mas esse valor só é lido no arranque para ser apagado. A escrita é código morto e pode ser removida.
+- **Print com aquecedor já ligado e ID inválido**: se o aquecedor foi ligado com o ID válido, o ID falha depois e o print começa, `_sync_print` não fixa nozzle. Se o `PRINT_START` mandar `M104`/`M109`, o print é recusado; se não mandar, o aquecedor fica ligado o print todo sem nozzle conhecido e sem relatório no fim. Correção proposta: no início do print sem ID válido, desligar o aquecedor (`target = 0`) com a mensagem normal de aquecimento bloqueado. **Adiado.**
 - `bed_custom_bound.py` lê `MOVE_TO_PARK=False` como verdadeiro (`parser=bool` sobre a string "False"), o que leva a um parque indesejado em X0 Y500. As macros do print core deixaram de passar esse parâmetro, mas as da RF50 ainda o passam (`homing-override`, `clean_nozzle`, `park`, `prime_extruder`); o módulo em si **não foi corrigido** e também escreve em `kin.limits` diretamente. A correção só deve ser feita depois de confirmar que nada dependia do parque após o homing.
 - Com o termístor avariado no arranque, a máquina não chega a ficar pronta (shutdown do MCU antes de o módulo correr). Isto vem de ler o código do Klipper de referência e **precisa de confirmação no `klippy.log`**.
 - Se os sensores do Happy Hare devolverem `None`, a troca é bloqueada; ver a mensagem de aborto.
