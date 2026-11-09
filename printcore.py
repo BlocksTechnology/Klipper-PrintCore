@@ -250,6 +250,43 @@ class PrintCore:
                 "printcore: no swap in progress",
             )
 
+    def _id_unread_action(self):
+        # What the user can do about an unreadable ID, in and out of a swap
+        if self.bypass_code:
+            return "If it keeps happening, contact support."
+        if self.swap_active:
+            return (
+                "To continue anyway, say which print core it is: "
+                "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 (names: %s)."
+                % self._names_str()
+            )
+        return (
+            "To use it anyway, with the heater off and no print running, "
+            "run PRINTCORE_ID_BYPASS NOZZLE=name CONFIRM=1 (names: %s)."
+            % self._names_str()
+        )
+
+    def _id_unread_msg(self):
+        return (
+            "Print core: mounted, but its ID cannot be read, so the nozzle "
+            "size is unknown. Reseat it and check the ID contact. "
+            + self._id_unread_action()
+        )
+
+    def _check_nozzle(self, gcmd, want):
+        if want is not None and want != self.eff_nozzle:
+            raise self._err(
+                gcmd,
+                "Print core: a different print core is mounted than "
+                "expected. Mounted: %s, expected: %s.%s"
+                % (
+                    pretty(self.eff_nozzle),
+                    pretty(want),
+                    " The swap stays active." if self.swap_active else "",
+                ),
+                "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
+            )
+
     def _bypass_on_msg(self, name):
         return (
             "Print core: ID check bypassed. Assuming %s nozzle until the next "
@@ -416,12 +453,8 @@ class PrintCore:
         elif self.id_fault_suspected:
             user = (
                 "Print core: heating is disabled because the print core's ID "
-                "cannot be read."
-                + (
-                    " Contact support."
-                    if self.bypass_code
-                    else " See PRINTCORE_ID_BYPASS."
-                )
+                "cannot be read. Reseat it and check the ID contact. "
+                + self._id_unread_action()
             )
         elif self.state == UNKNOWN:
             user = (
@@ -933,26 +966,9 @@ class PrintCore:
             was = self.id_fault_suspected
             self.id_fault_suspected = self._contra >= self.id_fault_secs
             if self.id_fault_suspected and not was and not self._bypass_active():
-                names = self._names_str()
-                if self.bypass_code:
-                    user = (
-                        "!! Print core: inserted, but its ID cannot be "
-                        "read, so the nozzle size is unknown. Check the "
-                        "print core connection. If it keeps happening, "
-                        "contact support."
-                    )
-                else:
-                    user = (
-                        "!! Print core: inserted, but its ID cannot be "
-                        "read, so the nozzle size is unknown. Check the "
-                        "print core connection. To use it anyway, with the "
-                        "heater off and no print running, run "
-                        "PRINTCORE_ID_BYPASS NOZZLE=name CONFIRM=1 "
-                        "(names: %s)" % names
-                    )
                 self._say(
                     None,
-                    user,
+                    "!! " + self._id_unread_msg(),
                     "!! printcore: ID fault suspected (id_state=%s, ADC %s), "
                     "RTD ok at %.1f C. Possible: %s. Run "
                     "PRINTCORE_ID_BYPASS NOZZLE=name CONFIRM=1 (names: %s)"
@@ -961,7 +977,7 @@ class PrintCore:
                         "-" if self.counts is None else "%.0f" % self.counts,
                         self.heater.last_temp,
                         self._id_hint(),
-                        names,
+                        self._names_str(),
                     ),
                 )
             if (
@@ -1314,21 +1330,9 @@ class PrintCore:
                 self._rtd = RTD_NEW
             elif res is None and self._rtd == RTD_NEW:
                 self._rtd = RTD_SEEN
-                names = self._names_str()
                 self._say(
                     None,
-                    "!! Print core: a print core is mounted "
-                    "(the temperature sensor responds) but its ID "
-                    "cannot be read, so the nozzle size is unknown. "
-                    "%s"
-                    % (
-                        "Reseat it and check the ID contact. If it "
-                        "keeps happening, contact support."
-                        if self.bypass_code
-                        else "Reseat it and check the ID contact, or "
-                        "finish with PRINT_CORE_CHANGE_DONE "
-                        "NOZZLE=name CONFIRM=1 (names: %s)." % names
-                    ),
+                    "!! " + self._id_unread_msg(),
                     "!! printcore: RTD ok but ID %s (ADC %.0f)"
                     % (self.state, self.counts or 0.0),
                 )
@@ -1404,33 +1408,16 @@ class PrintCore:
                 "printcore: ID bypass ON at swap end (%s)" % want,
             )
             return
-        lst = ", ".join(names)
-        if self.bypass_code:
-            user = (
-                "Print core: the print core is mounted "
-                "but its ID cannot be "
-                "read. Reseat it; if it still fails, contact support. "
-                "The swap stays active."
-            )
-        else:
-            user = (
-                "Print core: the print core is mounted (the "
-                "temperature sensor responds) but its ID cannot be "
-                "read. Reseat it and check the ID contact. To continue "
-                "anyway, say which print core it is: "
-                "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 "
-                "(names: %s). The swap stays active." % lst
-            )
         raise self._err(
             gcmd,
-            user,
+            self._id_unread_msg() + " The swap stays active.",
             "printcore: RTD ok but ID %s (ADC %.0f); need NOZZLE=name "
             "CONFIRM=1%s (valid: %s); swap stays active"
             % (
                 self.state,
                 self.counts or 0.0,
                 " CODE=code" if self.bypass_code else "",
-                lst,
+                self._names_str(),
             ),
         )
 
@@ -1445,29 +1432,14 @@ class PrintCore:
             if want is None or want not in self._nozzle_names():
                 raise self._err(
                     gcmd,
-                    "Print core: the ID cannot be read. %s"
-                    "The swap stays active."
-                    % (
-                        "Contact support. "
-                        if self.bypass_code
-                        else "Say which print core you mounted: "
-                        "PRINT_CORE_CHANGE_DONE NOZZLE=name CONFIRM=1 "
-                        "(names: %s). " % names
-                    ),
+                    self._id_unread_msg() + " The swap stays active.",
                     "printcore: ID bypass active, NOZZLE=name required at "
                     "swap end (valid: %s); swap stays active" % names,
                 )
             if not self._code_ok(gcmd):
                 raise self._code_error(gcmd)
             self.bypass_nozzle = want
-        if want is not None and want != self.eff_nozzle:
-            raise self._err(
-                gcmd,
-                "Print core: a different print core is mounted "
-                "than expected. Mounted: %s, expected: %s. The swap "
-                "stays active." % (pretty(self.eff_nozzle), pretty(want)),
-                "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
-            )
+        self._check_nozzle(gcmd, want)
         res = self._rtd_probe()
         if res is not None:
             raise self._err(
@@ -1632,14 +1604,7 @@ class PrintCore:
                 "Print core: no print core detected.",
                 "printcore: no valid print core (state=%s)" % (self.state,),
             )
-        if want is not None and want != self.eff_nozzle:
-            raise self._err(
-                gcmd,
-                "Print core: a different print core is mounted than "
-                "expected. Mounted: %s, expected: %s."
-                % (pretty(self.eff_nozzle), pretty(want)),
-                "printcore: mounted '%s', expected '%s'" % (self.eff_nozzle, want),
-            )
+        self._check_nozzle(gcmd, want)
 
     def _macro_vars(self, name):
         macro = self.printer.lookup_object("gcode_macro " + name, None)
